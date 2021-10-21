@@ -40,6 +40,19 @@
 #define BLOCK_ENQUEUE_IOCTL _IOWR('i', 0xa3, struct block)
 #define BLOCK_DEQUEUE_IOCTL _IOWR('i', 0xa4, struct block)
 
+#define IIO_DMABUF_ALLOC_IOCTL		_IOW('i', 0x92, struct iio_dmabuf_req)
+#define IIO_DMABUF_ENQUEUE_IOCTL	_IOW('i', 0x93, struct iio_dmabuf)
+
+#define IIO_DMABUF_FLAG_CYCLIC		BIT(0)
+
+#define DMA_BUF_SYNC_READ      (1 << 0)
+#define DMA_BUF_SYNC_WRITE     (2 << 0)
+#define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START     (0 << 2)
+#define DMA_BUF_SYNC_END       (1 << 2)
+
+#define DMA_BUF_IOCTL_SYNC	_IOW('b', 0, struct dma_buf_sync)
+
 #define BLOCK_FLAG_CYCLIC BIT(1)
 
 /* Forward declarations */
@@ -63,6 +76,11 @@ struct block_alloc_req {
 		 id;
 };
 
+struct iio_dmabuf_req {
+	uint64_t size;
+	uint64_t resv;
+};
+
 struct block {
 	uint32_t id,
 		 size,
@@ -73,6 +91,16 @@ struct block {
 	uint64_t timestamp;
 };
 
+struct iio_dmabuf {
+	int32_t fd;
+	uint32_t flags;
+	uint64_t bytes_used;
+};
+
+struct dma_buf_sync {
+	uint64_t flags;
+};
+
 struct iio_device_pdata {
 	int fd;
 	bool blocking;
@@ -80,10 +108,14 @@ struct iio_device_pdata {
 	unsigned int max_nb_blocks;
 	unsigned int allocated_nb_blocks;
 
+	struct iio_dmabuf *dmabufs;
+	size_t dmabuf_size;
+
 	struct block *blocks;
 	void **addrs;
 	int last_dequeued;
-	bool is_high_speed, cyclic, cyclic_buffer_enqueued;
+	unsigned int next_block;
+	bool is_high_speed, new_api, cyclic, cyclic_buffer_enqueued;
 
 	int cancel_fd;
 };
@@ -263,12 +295,12 @@ static int get_rel_timeout_ms(struct timespec *start, unsigned int timeout_rel)
 	return (int) timeout_rel;
 }
 
-static int device_check_ready(const struct iio_device *dev, short events,
-	struct timespec *start)
+static int device_check_ready_fd(const struct iio_device *dev, int fd,
+				 short events, struct timespec *start)
 {
 	struct pollfd pollfd[2] = {
 		{
-			.fd = dev->pdata->fd,
+			.fd = fd,
 			.events = events,
 		}, {
 			.fd = dev->pdata->cancel_fd,
@@ -299,6 +331,12 @@ static int device_check_ready(const struct iio_device *dev, short events,
 	if (!(pollfd[0].revents & events))
 		return -EIO;
 	return 0;
+}
+
+static int device_check_ready(const struct iio_device *dev, short events,
+	struct timespec *start)
+{
+	return device_check_ready_fd(dev, dev->pdata->fd, events, start);
 }
 
 static ssize_t local_read(const struct iio_device *dev,
@@ -425,60 +463,139 @@ static int local_set_kernel_buffers_count(const struct iio_device *dev,
 	return 0;
 }
 
+static int local_enqueue_block_mmap(int fd, struct block *block,
+			size_t bytes_used, bool cyclic)
+{
+	if (cyclic)
+	      block->flags |= BLOCK_FLAG_CYCLIC;
+	block->bytes_used = bytes_used;
+
+	return ioctl_nointr(fd, BLOCK_ENQUEUE_IOCTL, block);
+}
+
+static int local_enqueue_block_dmabuf(int fd, struct iio_dmabuf *dmabuf,
+			size_t bytes_used, bool cyclic)
+{
+	struct dma_buf_sync dbuf_sync;
+	int ret;
+
+	if (cyclic)
+	      dmabuf->flags |= IIO_DMABUF_FLAG_CYCLIC;
+	dmabuf->bytes_used = bytes_used;
+
+	dbuf_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
+
+	/* Disable CPU access to last block */
+	ret = ioctl_nointr(dmabuf->fd, DMA_BUF_IOCTL_SYNC, &dbuf_sync);
+	if (ret)
+	      return ret;
+
+	/* Enqueue the last block */
+	return ioctl_nointr(fd, IIO_DMABUF_ENQUEUE_IOCTL, dmabuf);
+}
+
+static int local_enqueue_block(struct iio_device_pdata *pdata,
+			unsigned int idx, size_t bytes_used)
+{
+	if (WITH_LOCAL_DMABUF_API && pdata->new_api) {
+	      return local_enqueue_block_dmabuf(pdata->fd, &pdata->dmabufs[idx],
+				      bytes_used, pdata->cyclic);
+	}
+
+	if (WITH_LOCAL_MMAP_API) {
+		return local_enqueue_block_mmap(pdata->fd, &pdata->blocks[idx],
+					bytes_used, pdata->cyclic);
+	}
+
+	return -ENOSYS;
+}
+
+static int local_dequeue_block_dmabuf(const struct iio_device *dev)
+{
+	struct timespec start;
+	struct dma_buf_sync dbuf_sync;
+	int ret, fd = dev->pdata->dmabufs[dev->pdata->next_block].fd;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	ret = device_check_ready_fd(dev, fd, POLLOUT, &start);
+	if (ret < 0)
+		return ret;
+
+	dbuf_sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
+
+	/* Enable CPU access to new block */
+	return ioctl_nointr(fd, DMA_BUF_IOCTL_SYNC, &dbuf_sync);
+}
+
+static int local_dequeue_block_mmap(const struct iio_device *dev)
+{
+	struct timespec start;
+	struct block block;
+	int ret;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	do {
+		ret = device_check_ready(dev, POLLIN | POLLOUT, &start);
+		if (ret < 0)
+			return ret;
+
+		memset(&block, 0, sizeof(block));
+		ret = ioctl_nointr(dev->pdata->fd, BLOCK_DEQUEUE_IOCTL, &block);
+	} while (dev->pdata->blocking && ret == -EAGAIN);
+
+	return ret;
+}
+
+static int local_dequeue_block(const struct iio_device *dev)
+{
+	if (WITH_LOCAL_DMABUF_API && dev->pdata->new_api)
+		return local_dequeue_block_dmabuf(dev);
+
+	if (WITH_LOCAL_MMAP_API)
+	      return local_dequeue_block_mmap(dev);
+
+	return -ENOSYS;
+}
+
 static ssize_t local_get_buffer(const struct iio_device *dev,
 		void **addr_ptr, size_t bytes_used,
 		uint32_t *mask, size_t words)
 {
-	struct block block;
 	struct iio_device_pdata *pdata = dev->pdata;
-	struct timespec start;
-	int f = pdata->fd;
 	ssize_t ret;
 
-	if (!WITH_LOCAL_MMAP_API || !pdata->is_high_speed)
+	if (!pdata->is_high_speed)
 		return -ENOSYS;
-	if (f == -1)
+	if (pdata->fd == -1)
 		return -EBADF;
 	if (!addr_ptr)
 		return -EINVAL;
 
 	if (pdata->last_dequeued >= 0) {
-		struct block *last_block = &pdata->blocks[pdata->last_dequeued];
+		if (pdata->cyclic && pdata->cyclic_buffer_enqueued)
+		      return -EBUSY;
 
-		if (pdata->cyclic) {
-			if (pdata->cyclic_buffer_enqueued)
-				return -EBUSY;
-			pdata->blocks[0].flags |= BLOCK_FLAG_CYCLIC;
-			pdata->cyclic_buffer_enqueued = true;
-		}
-
-		last_block->bytes_used = bytes_used;
-		ret = (ssize_t) ioctl_nointr(f,
-				BLOCK_ENQUEUE_IOCTL, last_block);
+		ret = (ssize_t) local_enqueue_block(pdata, pdata->last_dequeued,
+					bytes_used);
 		if (ret) {
 			dev_perror(dev, -ret, "Unable to enqueue block");
 			return ret;
 		}
 
+		if (pdata->cyclic)
+		      pdata->cyclic_buffer_enqueued = true;
+
 		if (pdata->cyclic) {
 			*addr_ptr = pdata->addrs[pdata->last_dequeued];
-			return (ssize_t) last_block->bytes_used;
+			return (ssize_t) bytes_used;
 		}
 
 		pdata->last_dequeued = -1;
 	}
 
-	clock_gettime(CLOCK_MONOTONIC, &start);
-
-	do {
-		ret = (ssize_t) device_check_ready(dev, POLLIN | POLLOUT, &start);
-		if (ret < 0)
-			return ret;
-
-		memset(&block, 0, sizeof(block));
-		ret = (ssize_t) ioctl_nointr(f, BLOCK_DEQUEUE_IOCTL, &block);
-	} while (pdata->blocking && ret == -EAGAIN);
-
+	ret = (ssize_t) local_dequeue_block(dev);
 	if (ret) {
 		if ((!pdata->blocking && ret != -EAGAIN) ||
 				(pdata->blocking && ret != -ETIMEDOUT)) {
@@ -487,9 +604,13 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 		return ret;
 	}
 
-	pdata->last_dequeued = block.id;
-	*addr_ptr = pdata->addrs[block.id];
-	return (ssize_t) block.bytes_used;
+	pdata->last_dequeued = pdata->next_block;
+	*addr_ptr = pdata->addrs[pdata->next_block];
+
+	if (++pdata->next_block == pdata->allocated_nb_blocks)
+		pdata->next_block = 0;
+
+	return (ssize_t) bytes_used;
 }
 
 static ssize_t local_read_all_dev_attrs(const struct iio_device *dev,
@@ -792,6 +913,77 @@ static int channel_write_state(const struct iio_channel *chn, bool en)
 		return 0;
 }
 
+static int enable_dmabuf_api(const struct iio_device *dev)
+{
+	struct iio_device_pdata *pdata = dev->pdata;
+	struct iio_dmabuf_req req;
+	unsigned int i, nb_blocks;
+	int ret, fd = pdata->fd;
+
+	/* Cyclic mode isn't supported yet. */
+	if (pdata->cyclic) {
+		nb_blocks = 1;
+		dev_dbg(dev, "Enabling cyclic mode\n");
+	} else {
+		nb_blocks = pdata->max_nb_blocks;
+	}
+
+	pdata->dmabufs = calloc(nb_blocks, sizeof(*pdata->dmabufs));
+	if (!pdata->dmabufs)
+		return -ENOMEM;
+
+	pdata->addrs = calloc(nb_blocks, sizeof(*pdata->addrs));
+	if (!pdata->addrs) {
+		ret = -ENOMEM;
+		goto err_free_block;
+	}
+
+	req.size = pdata->samples_count *
+		iio_device_get_sample_size_mask(dev, dev->mask, dev->words);
+	req.resv = 0;
+
+	for (i = 0; i < nb_blocks; i++) {
+		ret = ioctl_nointr(fd, IIO_DMABUF_ALLOC_IOCTL, &req);
+
+		/* If we get a -EINVAL error here, the ioctl is wrong and the
+		 * high-speed2 interface is not supported. */
+		if (ret == -ENODEV || ret == -EINVAL)
+			ret = -ENOSYS;
+		if (ret < 0)
+			goto err_munmap;
+
+		pdata->dmabufs[i].fd = ret;
+
+		pdata->addrs[i] = mmap(0, req.size,
+				       PROT_READ | PROT_WRITE,
+				       MAP_SHARED, pdata->dmabufs[i].fd, 0);
+		if (pdata->addrs[i] == MAP_FAILED) {
+			ret = -errno;
+			close(pdata->dmabufs[i].fd);
+			goto err_munmap;
+		}
+	}
+
+	pdata->next_block = 0;
+	pdata->dmabuf_size = req.size;
+	pdata->allocated_nb_blocks = nb_blocks;
+	pdata->last_dequeued = -1;
+	return 0;
+
+err_munmap:
+	for (; i > 0; i--) {
+		munmap(pdata->addrs[i - 1], req.size);
+		close(pdata->dmabufs[i].fd);
+	}
+	pdata->allocated_nb_blocks = 0;
+	free(pdata->addrs);
+	pdata->addrs = NULL;
+err_free_block:
+	free(pdata->dmabufs);
+	pdata->dmabufs = NULL;
+	return ret;
+}
+
 static int enable_high_speed(const struct iio_device *dev)
 {
 	struct block_alloc_req req;
@@ -942,12 +1134,27 @@ static int local_open(const struct iio_device *dev,
 	pdata->cyclic_buffer_enqueued = false;
 	pdata->samples_count = samples_count;
 
-	if (WITH_LOCAL_MMAP_API) {
+	if (WITH_LOCAL_DMABUF_API) {
+		ret = enable_dmabuf_api(dev);
+		if (ret < 0 && ret != -ENOSYS)
+			goto err_close;
+
+		pdata->new_api = !ret;
+		pdata->is_high_speed = !ret;
+
+		if (pdata->new_api)
+		      dev_dbg(dev, "Enable DMABUF based API\n");
+	}
+
+	if (WITH_LOCAL_MMAP_API && !pdata->new_api) {
 		ret = enable_high_speed(dev);
 		if (ret < 0 && ret != -ENOSYS)
 			goto err_close;
 
 		pdata->is_high_speed = !ret;
+
+		if (pdata->is_high_speed)
+		      dev_dbg(dev, "Enable old MMAP based API\n");
 	}
 
 	if (!pdata->is_high_speed) {
@@ -991,7 +1198,12 @@ static int local_close(const struct iio_device *dev)
 
 	ret = 0;
 	ret1 = 0;
-	if (pdata->is_high_speed) {
+	if (WITH_LOCAL_DMABUF_API && pdata->new_api) {
+		for (i = 0; i < pdata->allocated_nb_blocks; i++) {
+			munmap(pdata->addrs[i], pdata->dmabuf_size);
+			close(pdata->dmabufs[i].fd);
+		}
+	} else if (pdata->is_high_speed) {
 		if (pdata->addrs) {
 			for (i = 0; i < pdata->allocated_nb_blocks; i++)
 				munmap(pdata->addrs[i], pdata->blocks[i].size);
@@ -1001,6 +1213,9 @@ static int local_close(const struct iio_device *dev)
 		if (ret) {
 			dev_perror(dev, -ret, "Error during ioctl()");
 		}
+	}
+
+	if (pdata->is_high_speed) {
 		pdata->allocated_nb_blocks = 0;
 		free(pdata->addrs);
 		pdata->addrs = NULL;

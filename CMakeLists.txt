@@ -292,6 +292,7 @@ if(WITH_LOCAL_BACKEND)
 	endif()
 
 	option(WITH_LOCAL_MMAP_API "Use the mmap API provided in Analog Devices' kernel (not upstream)" ON)
+	option(WITH_LOCAL_DMABUF_API "Use the DMABUF based API" ON)
 endif()
 
 option(WITH_SERIAL_BACKEND "Enable the serial backend" OFF)
