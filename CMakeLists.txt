@@ -290,6 +290,8 @@ if(WITH_LOCAL_BACKEND)
 	if (WITH_LOCAL_CONFIG)
 		target_sources(iio PRIVATE libini/libini.c)
 	endif()
+
+	option(WITH_LOCAL_MMAP_API "Use the mmap API provided in Analog Devices' kernel (not upstream)" ON)
 endif()
 
 option(WITH_SERIAL_BACKEND "Enable the serial backend" OFF)
