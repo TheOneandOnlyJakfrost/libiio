@@ -1137,6 +1137,23 @@ err_bad_uri:
 	return NULL;
 }
 
+static bool usb_missing_scan(struct iio_scan_result *scan_result,
+		struct libusb_device *dev, unsigned int intrfc) {
+
+	char uri[sizeof("usb:127.255.255")];
+	size_t i;
+
+	iio_snprintf(uri, sizeof(uri), "usb:%d.%d.%u",
+		libusb_get_bus_number(dev), libusb_get_device_address(dev),
+		intrfc);
+	for (i = 0; i < scan_result->size; i++) {
+		if (!strncmp(scan_result->info[i]->uri, uri, sizeof("usb:127.255.255") - 1))
+			return false;
+	}
+
+	return true;
+}
+
 static int usb_fill_context_info(struct iio_context_info *info,
 		struct libusb_device *dev, struct libusb_device_handle *hdl,
 		unsigned int intrfc)
@@ -1200,13 +1217,63 @@ static int usb_fill_context_info(struct iio_context_info *info,
 	return 0;
 }
 
-int usb_context_scan(struct iio_scan_result *scan_result)
+static int parse_value(const char *str)
+{
+	uint32_t val;
+	char *ptr;
+
+	/* if it is null or '*' accept any */
+	if (str == NULL || *str == '*')
+		return 0;
+	/* if it's empty, that's not valid */
+	if (*str == '\0')
+		return -1;
+
+	val = strtoul(str, &ptr, 16);
+	if (ptr == str)
+		return -1;
+
+	/* should be either ":" or end of string */
+	if (*ptr != ':' && *ptr != '\0')
+		return -1;
+
+	if (val > 0xFFFF)
+		return -1;
+
+	return val;
+}
+
+int usb_context_scan(struct iio_scan_result *scan_result,
+		char *pid_vid)
 {
 	struct iio_context_info *info;
 	libusb_device **device_list;
 	libusb_context *ctx;
 	unsigned int i;
 	int ret;
+	uint16_t scan_usb_vid = 0, scan_usb_pid = 0;
+	char *ptr;
+
+	if (pid_vid) {
+		/* string must be in "usb=%04hx:%04hx" format */
+		if (strncmp(pid_vid, "usb", sizeof("usb") -1))
+			return -ENODEV;
+
+		if (!strncmp(pid_vid, "usb=", sizeof("usb=") - 1) ) {
+			ret = parse_value(&pid_vid[4]);
+			if (ret < 0)
+				return -ENODEV;
+			scan_usb_vid = ret;
+			ptr = strchr(&pid_vid[4], ':');
+			if (ptr && ptr[1] != '\0') {
+				ret = parse_value(&ptr[1]);
+				if (ret < 0)
+					return -ENODEV;
+				scan_usb_pid = ret;
+			} else
+				return -ENODEV;
+		}
+	}
 
 	ret = libusb_init(&ctx);
 	if (ret < 0)
@@ -1223,11 +1290,26 @@ int usb_context_scan(struct iio_scan_result *scan_result)
 		struct libusb_device *dev = device_list[i];
 		unsigned int intrfc = 0;
 
+		/* If we are given a pid or vid, use that to qualify for things,
+		 * this avoids open/closing random devices & potentially locking
+		 * (blocking them) from other applications
+		 */
+		if(scan_usb_vid || scan_usb_pid) {
+			struct libusb_device_descriptor device_descriptor;
+			ret = libusb_get_device_descriptor(dev, &device_descriptor);
+			if (ret)
+				continue;
+			if (scan_usb_vid && scan_usb_vid != device_descriptor.idVendor)
+				continue;
+			if (scan_usb_pid && scan_usb_pid != device_descriptor.idProduct)
+				continue;
+		}
+
 		ret = libusb_open(dev, &hdl);
 		if (ret)
 			continue;
 
-		if (!iio_usb_match_device(dev, hdl, &intrfc)) {
+		if (!iio_usb_match_device(dev, hdl, &intrfc) && usb_missing_scan(scan_result, dev, intrfc)) {
 			info = iio_scan_result_add(scan_result);
 			if (!info)
 				ret = -ENOMEM;
