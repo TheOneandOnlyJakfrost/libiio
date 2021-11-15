@@ -60,6 +60,11 @@ normally returned from
 .IP serial:[port]
 .IP local
 with no address part
+.TP
+.B \-S, \-\-Scan
+Scan for available IIO contexts, optional arg of specific backend(s) 'ip', 'usb' or 'ip:usb'.
+Specific options for USB include product ID and Vendor ID to limit scanning to specific devicesi 'usb,vid:0456,pid:b673'.
+If no argument is given, it checks all that are availble.
 .RE
 .TP
 .B \-t \-\-trigger
