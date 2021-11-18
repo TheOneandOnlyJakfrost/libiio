@@ -1263,13 +1263,13 @@ int usb_context_scan(struct iio_scan_result *scan_result,
 			ret = parse_value(&pid_vid[4]);
 			if (ret < 0)
 				return -ENODEV;
-			scan_usb_vid = ret;
+			scan_usb_vid = (uint16_t)(ret & 0xFFFF);
 			ptr = strchr(&pid_vid[4], ':');
 			if (ptr && ptr[1] != '\0') {
 				ret = parse_value(&ptr[1]);
 				if (ret < 0)
 					return -ENODEV;
-				scan_usb_pid = ret;
+				scan_usb_pid = (uint16_t)(ret & 0xFFFF);
 			} else
 				return -ENODEV;
 		}

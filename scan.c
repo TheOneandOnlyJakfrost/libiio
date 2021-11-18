@@ -150,7 +150,7 @@ struct iio_scan_context * iio_create_scan_context(
 			ctx->local_opts = realloc(ctx->local_opts, (ctx->local_num + 1) * sizeof(char *));
 			if (!ctx->local_opts)
 				goto create_scan_fail;
-			ctx->local_opts[ctx->local_num] = strndup(ptr, sizeof("local=1234567890") - 1);
+			ctx->local_opts[ctx->local_num] = iio_strndup(ptr, sizeof("local=1234567890") - 1);
 			if (!ctx->local_opts[ctx->local_num])
 				goto create_scan_fail;
 			ctx->local_num++;
@@ -166,14 +166,14 @@ struct iio_scan_context * iio_create_scan_context(
 
 			p1 = strchr(ptr, ',');
 			p2 = strchr(ptr,'\0');
-			if ((p1 && (p1 - ptr >= sizeof("usb=1234:5678")) ||
-			    (p2 && !p1 && (p2 - ptr >= sizeof("usb=1234:5678")))))
+			if ((p1 && ((size_t)(p1 - ptr) >= sizeof("usb=1234:5678"))) ||
+			    (p2 && !p1 && ((size_t)(p2 - ptr) >= sizeof("usb=1234:5678"))))
 				goto create_scan_fail;
 
 			ctx->usb_opts = realloc(ctx->usb_opts, (ctx->usb_num + 1) * sizeof(char *));
 			if (!ctx->usb_opts)
 				goto create_scan_fail;
-			ctx->usb_opts[ctx->usb_num] = strndup(ptr, sizeof("usb=1234:5678") - 1);
+			ctx->usb_opts[ctx->usb_num] = iio_strndup(ptr, sizeof("usb=1234:5678") - 1);
 			if (!ctx->usb_opts[ctx->usb_num])
 				goto create_scan_fail;
 			if ((end = strchr(ctx->usb_opts[ctx->usb_num], ',')))
