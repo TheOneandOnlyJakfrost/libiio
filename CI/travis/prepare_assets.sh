@@ -1,6 +1,8 @@
 #!/bin/bash -e
 
-move_artifacts() {
+set -x
+
+release_artifacts() {
 	local rpm_assets='CentOS-7-x86_64 CentOS-8-x86_64'
 	cd "${BUILD_ARTIFACTSTAGINGDIRECTORY}"
 	for i in $rpm_assets; do
@@ -21,7 +23,7 @@ move_artifacts() {
                 rm -r "${i}"
         done
 
-	local pkg_assets='macOS-10.14 macOS-10.15'
+	local pkg_assets='macOS-10.15 macOS-11'
         cd "${BUILD_ARTIFACTSTAGINGDIRECTORY}"
         for i in $pkg_assets; do
                 cd "${i}"
@@ -42,5 +44,16 @@ archive_windows() {
         done
 }
 
-move_artifacts
-archive_windows
+swdownloads_artifacts() {
+        cd "${BUILD_ARTIFACTSTAGINGDIRECTORY}"
+        local linux_dist='CentOS-7-x86_64 CentOS-8-x86_64 Ubuntu-16.04-x86_64 Ubuntu-18.04-x86_64
+                                Ubuntu-20.04-x86_64 Debian-Buster-ARM Debian-Buster-ARM64'
+        for distribution in $linux_dist; do
+                find ./Linux-${distribution} -name '*.rpm' -exec mv {} ../${distribution}_latest_master_libiio.rpm ";"
+                find ./Linux-${distribution} -name '*.deb' -exec mv {} ../${distribution}_latest_master_libiio.deb ";"
+                rm -r Linux-${distribution}
+		echo `ls -al`
+        done
+}
+
+${1}
